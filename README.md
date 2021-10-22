@@ -1,7 +1,7 @@
 # efivar
 Temporary repository until merged into u-root
 
-## Prerquisites
+## Prerequisites
 The example implementation can be used to list, read and write all
 existing efivars, for that the efivarfs needs to be mounted:
 
