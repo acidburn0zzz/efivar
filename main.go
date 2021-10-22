@@ -12,7 +12,7 @@ import (
 	"os"
 	"path/filepath"
 
-	"github.com/u-root/u-root/pkg/efivarfs"
+	"github.com/system-transparency/efivar/efivarfs"
 )
 
 var (
