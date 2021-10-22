@@ -20,6 +20,6 @@ Running `efivar -help` already reveals the available options.
 The format needed wenn reading or writing to a var is the same
 that `-list` returns, so Name-GUID. If write is called on a not
 yet existing variable, it is being created. The data that is supposed
-to be written should be specified using `-content` and so far it as
+to be written should be specified using `-content` and so far it has
 been verified to work using a 16KiB big random textfile but in theory
 every decently sized file should be usable.
