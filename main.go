@@ -9,8 +9,10 @@ import (
 	"bytes"
 	"flag"
 	"log"
+	"math/rand"
 	"os"
 	"path/filepath"
+	"strings"
 
 	"github.com/system-transparency/efivar/efivarfs"
 )
@@ -57,6 +59,13 @@ func main() {
 	}
 
 	if *write != "" {
+		if strings.ContainsAny(*write, "-") {
+			v := strings.SplitN(*write, "-", 2)
+			_, err := efivarfs.DecodeGUIDString(v[1])
+			if err != nil {
+				log.Fatal("Var name malformed: Must be either Name-GUID or just Name")
+			}
+		}
 		path, err := filepath.Abs(*content)
 		if err != nil {
 			log.Fatalf("Could not resolve path: %v", err)
@@ -64,6 +73,13 @@ func main() {
 		b, err := os.ReadFile(path)
 		if err != nil {
 			log.Fatalf("Failed to read file: %v", err)
+		}
+		if !strings.ContainsAny(*write, "-") {
+			var array [6]uint8
+			for i := range array {
+				array[i] = uint8(rand.Uint32())
+			}
+			*write = *write + "-" + efivarfs.MakeGUID(rand.Uint32(), uint16(rand.Uint32()), uint16(rand.Uint32()), uint16(rand.Uint32()), array).String()
 		}
 		err = efivarfs.SimpleWriteVariable(*write, 7, *bytes.NewBuffer(b))
 		if err != nil {
