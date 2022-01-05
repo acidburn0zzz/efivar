@@ -15,33 +15,37 @@ import (
 	"sort"
 	"syscall"
 
+	guid "github.com/google/uuid"
 	"golang.org/x/sys/unix"
 )
 
-func init() {
-	if !probeEfivarfs() {
-		return
-	}
-}
-
 // EfiVarFs is the path to the efivarfs mount point
-const EfiVarFs = "/sys/firmware/efi/efivars/"
+var EfiVarFs = "/sys/firmware/efi/efivars/"
 
-var vars varsBackend = varfsBackend{}
-
-type varsBackend interface {
-	Get(name string, guid GUID) (VariableAttributes, []byte, error)
-	Set(name string, guid GUID, attrs VariableAttributes, data []byte) (bool, error)
-	Delete(name string, guid GUID) error
+type backend interface {
+	// Get reads the contents of an efivar if it exists and has the necessary permission
+	Get(name string, guid *guid.UUID) (VariableAttributes, []byte, error)
+	// Set modifies a given efivar with the provided contents
+	Set(name string, guid *guid.UUID, attrs VariableAttributes, data []byte) error
+	// Remove makes the specified EFI var mutable and then deletes it
+	Remove(name string, guid *guid.UUID) error
+	// List returns the VariableDescriptor for each efivar in the system
 	List() ([]VariableDescriptor, error)
 }
 
-type varfsBackend struct{}
+type varfs struct{}
+
+var vars backend = varfs{}
 
 // Get reads the contents of an efivar if it exists and has the necessary permission
-func (v varfsBackend) Get(name string, guid GUID) (VariableAttributes, []byte, error) {
-	path := filepath.Join(EfiVarFs, fmt.Sprintf("%s-%s", name, guid))
-	f, err := openVarfsFile(path, os.O_RDONLY, 0)
+func (v varfs) Get(name string, guid *guid.UUID) (VariableAttributes, []byte, error) {
+	// Check if there is an efivarfs present
+	if !probeEfivarfs(EfiVarFs) {
+		return 0, nil, ErrFsNotMounted
+	}
+
+	path := filepath.Join(EfiVarFs, fmt.Sprintf("%s-%s", name, guid.String()))
+	f, err := openFile(path, os.O_RDONLY, 0)
 	switch {
 	case os.IsNotExist(err):
 		return 0, nil, ErrVarNotExist
@@ -53,8 +57,7 @@ func (v varfsBackend) Get(name string, guid GUID) (VariableAttributes, []byte, e
 	defer f.Close()
 
 	var attrs VariableAttributes
-	err = binary.Read(f, binary.LittleEndian, &attrs)
-	if err != nil {
+	if err := binary.Read(f, binary.LittleEndian, &attrs); err != nil {
 		if err == io.EOF {
 			return 0, nil, ErrVarNotExist
 		}
@@ -69,46 +72,51 @@ func (v varfsBackend) Get(name string, guid GUID) (VariableAttributes, []byte, e
 }
 
 // Set modifies a given efivar with the provided contents
-func (v varfsBackend) Set(name string, guid GUID, attrs VariableAttributes, data []byte) (bool, error) {
-	path := filepath.Join(EfiVarFs, fmt.Sprintf("%s-%s", name, guid))
+func (v varfs) Set(name string, guid *guid.UUID, attrs VariableAttributes, data []byte) error {
+	// Check if there is an efivarfs present
+	if !probeEfivarfs(EfiVarFs) {
+		return ErrFsNotMounted
+	}
+
+	path := filepath.Join(EfiVarFs, fmt.Sprintf("%s-%s", name, guid.String()))
 	flags := os.O_WRONLY | os.O_CREATE
 	if attrs&AttributeAppendWrite != 0 {
 		flags |= os.O_APPEND
 	}
 
-	read, err := openVarfsFile(path, os.O_RDONLY, 0)
+	read, err := openFile(path, os.O_RDONLY, 0)
 	switch {
 	case os.IsNotExist(err):
 	case os.IsPermission(err):
-		return false, ErrVarPermission
+		return ErrVarPermission
 	case err != nil:
-		return false, err
+		return err
 	default:
 		defer read.Close()
 
 		restoreImmutable, err := makeVarFileMutable(read)
 		switch {
 		case os.IsPermission(err):
-			return false, ErrVarPermission
+			return ErrVarPermission
 		case err != nil:
-			return false, err
+			return err
 		}
 		defer restoreImmutable()
 	}
 
-	write, err := openVarfsFile(path, flags, 0644)
+	write, err := openFile(path, flags, 0644)
 	switch {
 	case os.IsPermission(err):
 		pe, ok := err.(*os.PathError)
 		if !ok {
-			return false, err
+			return err
 		}
 		if pe.Err == syscall.EACCES {
 			// open will fail with EACCES if we lack the privileges
 			// to write to the file or the parent directory in the
 			// case where we need to create a new file. Don't retry
 			// in this case.
-			return false, ErrVarPermission
+			return ErrVarPermission
 		}
 
 		// open will fail with EPERM if the file exists but we can't
@@ -117,38 +125,41 @@ func (v varfsBackend) Set(name string, guid GUID, attrs VariableAttributes, data
 		// writing to the variable or may have deleted and recreated
 		// it, making the underlying inode immutable again. Retry in
 		// this case.
-		return true, ErrVarPermission
+		return ErrVarRetry
 	case err != nil:
-		return false, err
+		return err
 	}
 	defer write.Close()
 
 	var buf bytes.Buffer
-	err = binary.Write(&buf, binary.LittleEndian, attrs)
-	if err != nil {
-		return false, err
+	if err := binary.Write(&buf, binary.LittleEndian, attrs); err != nil {
+		return err
 	}
 	for len(data)%8 != 0 {
 		data = append(data, 0)
 	}
 	size, err := buf.Write(data)
 	if err != nil {
-		return false, err
+		return err
 	}
 	if (size-4)%8 == 0 {
-		return false, fmt.Errorf("data misaligned")
+		return fmt.Errorf("data misaligned")
 	}
-	_, err = buf.WriteTo(write)
-	if err != nil {
-		return false, err
+	if _, err := buf.WriteTo(write); err != nil {
+		return err
 	}
-	return false, nil
+	return nil
 }
 
-// Delete makes the specified EFI var mutable and then deletes it
-func (v varfsBackend) Delete(name string, guid GUID) error {
-	path := filepath.Join(EfiVarFs, fmt.Sprintf("%s-%s", name, guid))
-	f, err := openVarfsFile(path, os.O_WRONLY, 0)
+// Remove makes the specified EFI var mutable and then deletes it
+func (v varfs) Remove(name string, guid *guid.UUID) error {
+	// Check if there is an efivarfs present
+	if !probeEfivarfs(EfiVarFs) {
+		return ErrFsNotMounted
+	}
+
+	path := filepath.Join(EfiVarFs, fmt.Sprintf("%s-%s", name, guid.String()))
+	f, err := openFile(path, os.O_WRONLY, 0)
 	switch {
 	case os.IsNotExist(err):
 		return ErrVarNotExist
@@ -171,9 +182,14 @@ func (v varfsBackend) Delete(name string, guid GUID) error {
 }
 
 // List returns the VariableDescriptor for each efivar in the system
-func (v varfsBackend) List() ([]VariableDescriptor, error) {
+func (v varfs) List() ([]VariableDescriptor, error) {
+	// Check if there is an efivarfs present
+	if !probeEfivarfs(EfiVarFs) {
+		return nil, ErrFsNotMounted
+	}
+
 	const guidLength = 36
-	f, err := openVarfsFile(EfiVarFs, os.O_RDONLY, 0)
+	f, err := openFile(EfiVarFs, os.O_RDONLY, 0)
 	switch {
 	case os.IsNotExist(err):
 		return nil, ErrVarNotExist
@@ -211,12 +227,12 @@ func (v varfsBackend) List() ([]VariableDescriptor, error) {
 		}
 
 		name := dirent.Name()[:len(dirent.Name())-guidLength-1]
-		guid, err := DecodeGUIDString(dirent.Name()[len(name)+1:])
+		guid, err := guid.Parse(dirent.Name()[len(name)+1:])
 		if err != nil {
 			continue
 		}
 
-		entries = append(entries, VariableDescriptor{Name: name, GUID: guid})
+		entries = append(entries, VariableDescriptor{Name: name, GUID: &guid})
 	}
 
 	sort.Slice(entries, func(i, j int) bool {
@@ -225,10 +241,9 @@ func (v varfsBackend) List() ([]VariableDescriptor, error) {
 	return entries, nil
 }
 
-func probeEfivarfs() bool {
+func probeEfivarfs(path string) bool {
 	var stat unix.Statfs_t
-	err := unix.Statfs(EfiVarFs, &stat)
-	if err != nil {
+	if err := unix.Statfs(path, &stat); err != nil {
 		return false
 	}
 	if uint(stat.Type) != uint(unix.EFIVARFS_MAGIC) {

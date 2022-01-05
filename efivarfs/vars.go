@@ -12,6 +12,7 @@ import (
 	"os"
 	"strings"
 
+	guid "github.com/google/uuid"
 	"golang.org/x/sys/unix"
 )
 
@@ -19,87 +20,114 @@ import (
 type VariableAttributes uint32
 
 const (
-	AttributeNonVolatile                       VariableAttributes = 0x00000001
-	AttributeBootserviceAccess                 VariableAttributes = 0x00000002
-	AttributeRuntimeAccess                     VariableAttributes = 0x00000004
-	AttributeHardwareErrorRecord               VariableAttributes = 0x00000008
-	AttributeAuthenticatedWriteAccess          VariableAttributes = 0x00000010
+	// Variable is non volatile
+	AttributeNonVolatile VariableAttributes = 0x00000001
+	// Variable is accessible during boot service
+	AttributeBootserviceAccess VariableAttributes = 0x00000002
+	//Variable is accessible during runtime
+	AttributeRuntimeAccess VariableAttributes = 0x00000004
+	// Variable holds hardware error records
+	AttributeHardwareErrorRecord VariableAttributes = 0x00000008
+	// Variable needs authentication before write access
+	AttributeAuthenticatedWriteAccess VariableAttributes = 0x00000010
+	// Variable needs time based authentication before write access
 	AttributeTimeBasedAuthenticatedWriteAccess VariableAttributes = 0x00000020
-	AttributeAppendWrite                       VariableAttributes = 0x00000040
-	AttributeEnhancedAuthenticatedAccess       VariableAttributes = 0x00000080
+	// Data written to this variable is appended
+	AttributeAppendWrite VariableAttributes = 0x00000040
+	// Variable uses the new authentication format
+	AttributeEnhancedAuthenticatedAccess VariableAttributes = 0x00000080
 )
 
 var (
+	// ErrFsNotMounted is caused if no vailed efivarfs magic is found
+	ErrFsNotMounted = errors.New("no efivarfs magic found, is it mounted?")
+
+	// ErrVarsUnavailable is caused by not having a valid backend
 	ErrVarsUnavailable = errors.New("no variable backend is available")
-	ErrVarNotExist     = errors.New("variable does not exist")
-	ErrVarPermission   = errors.New("permission denied")
+
+	// ErrVarNotExist is caused by accessing a non-existing variable
+	ErrVarNotExist = errors.New("variable does not exist")
+
+	// ErrVarPermission is caused by not haven the right permissions either
+	// because of not being root or xattrs not allowing changes
+	ErrVarPermission = errors.New("permission denied")
+
+	// ErrVarRetry is caused if the previous action failed under a condition
+	// that indicates a retry might be necessary to fullfill the action
+	ErrVarRetry = errors.New("retry needed")
 )
 
 // VariableDescriptor contains the name and GUID identifying a variable
 type VariableDescriptor struct {
 	Name string
-	GUID GUID
+	GUID *guid.UUID
 }
 
-type VarFile interface {
+// File represents a file inside the efivarfs
+type File interface {
 	io.ReadWriteCloser
+
+	// Readdir is analog to fs.ReadDir
 	Readdir(n int) ([]os.FileInfo, error)
+
+	// GetInodeFlags returns the extended attributes of a file
 	GetInodeFlags() (int, error)
+
+	// SetInodeFlags sets the extended attributes of a file
 	SetInodeFlags(flags int) error
 }
 
-type varfsFile struct {
+type file struct {
 	*os.File
 }
 
 // ReadVariable calls Get() on the current efivarfs backend
-func ReadVariable(name string, guid GUID) (VariableAttributes, []byte, error) {
+func ReadVariable(name string, guid *guid.UUID) (VariableAttributes, []byte, error) {
 	return vars.Get(name, guid)
 }
 
 // SimpleReadVariable is like ReadVariables but takes the combined name and guid string
 // of the form name-guid and returns a bytes.Reader instead of a []byte
-func SimpleReadVariable(v string) (VariableAttributes, bytes.Reader, error) {
+func SimpleReadVariable(v string) (VariableAttributes, *bytes.Reader, error) {
 	vs := strings.SplitN(v, "-", 2)
-	g, err := DecodeGUIDString(vs[1])
+	g, err := guid.Parse(vs[1])
 	if err != nil {
-		return 0, *bytes.NewReader(nil), err
+		return 0, nil, err
 	}
-	attrs, data, err := vars.Get(vs[0], g)
-	return attrs, *bytes.NewReader(data), err
+	attrs, data, err := vars.Get(vs[0], &g)
+	return attrs, bytes.NewReader(data), err
 }
 
 // WriteVariable calls Set() on the current efivarfs backend
-func WriteVariable(name string, guid GUID, attrs VariableAttributes, data []byte) error {
-	return maybeRetry(4, func() (bool, error) { return vars.Set(name, guid, attrs, data) })
+func WriteVariable(name string, guid *guid.UUID, attrs VariableAttributes, data []byte) error {
+	return maybeRetry(4, func() error { return vars.Set(name, guid, attrs, data) })
 }
 
 // SimpleWriteVariable is like WriteVariables but takes the combined name and guid string
 // of the form name-guid and returns a bytes.Buffer instead of a []byte
 func SimpleWriteVariable(v string, attrs VariableAttributes, data bytes.Buffer) error {
 	vs := strings.SplitN(v, "-", 2)
-	g, err := DecodeGUIDString(vs[1])
+	g, err := guid.Parse(vs[1])
 	if err != nil {
 		return err
 	}
-	_, err = vars.Set(vs[0], g, attrs, data.Bytes())
-	return err
+	return vars.Set(vs[0], &g, attrs, data.Bytes())
 }
 
-// DeleteVariable calls Delete() on the current efivarfs backend
-func DeleteVariable(name string, guid GUID) error {
-	return vars.Delete(name, guid)
+// RemoveVariable calls Remove() on the current efivarfs backend
+func RemoveVariable(name string, guid *guid.UUID) error {
+	return vars.Remove(name, guid)
 }
 
-// SimpleDeleteVariable is like DeleteVariable but takes the combined name and guid string
+// SimpleRemoveVariable is like RemoveVariable but takes the combined name and guid string
 // of the form name-guid
-func SimpleDeleteVariable(v string) error {
+func SimpleRemoveVariable(v string) error {
 	vs := strings.SplitN(v, "-", 2)
-	g, err := DecodeGUIDString(vs[1])
+	g, err := guid.Parse(vs[1])
 	if err != nil {
 		return err
 	}
-	return vars.Delete(vs[0], g)
+	return vars.Remove(vs[0], &g)
 }
 
 // ListVariables calls List() on the current efivarfs backend
@@ -120,16 +148,16 @@ func SimpleListVariables() ([]string, error) {
 	return out, nil
 }
 
-func openVarfsFile(path string, flags int, perm os.FileMode) (VarFile, error) {
+func openFile(path string, flags int, perm os.FileMode) (File, error) {
 	f, err := os.OpenFile(path, flags, perm)
 	if err != nil {
 		return nil, err
 	}
-	return &varfsFile{f}, nil
+	return &file{f}, nil
 }
 
 // GetInodeFlags returns the extended attributes of a file
-func (f *varfsFile) GetInodeFlags() (int, error) {
+func (f *file) GetInodeFlags() (int, error) {
 	// If I knew how unix.Getxattr works I'd use that...
 	flags, err := unix.IoctlGetInt(int(f.Fd()), unix.FS_IOC_GETFLAGS)
 	if err != nil {
@@ -139,42 +167,44 @@ func (f *varfsFile) GetInodeFlags() (int, error) {
 }
 
 // SetInodeFlags sets the extended attributes of a file
-func (f *varfsFile) SetInodeFlags(flags int) error {
+func (f *file) SetInodeFlags(flags int) error {
 	// If I knew how unix.Setxattr works I'd use that...
-	err := unix.IoctlSetPointerInt(int(f.Fd()), unix.FS_IOC_SETFLAGS, flags)
-	if err != nil {
+	if err := unix.IoctlSetPointerInt(int(f.Fd()), unix.FS_IOC_SETFLAGS, flags); err != nil {
 		return &os.PathError{Op: "ioctl", Path: f.Name(), Err: err}
 	}
 	return nil
 }
 
-func makeVarFileMutable(f VarFile) (restore func() error, err error) {
-	const FS_IMMUTABLE_FL = int(0x00000010)
-
+func makeVarFileMutable(f File) (restore func(), err error) {
 	flags, err := f.GetInodeFlags()
 	if err != nil {
 		return nil, err
 	}
-	if flags&FS_IMMUTABLE_FL == 0 {
-		return func() error { return nil }, nil
+	if flags&unix.STATX_ATTR_IMMUTABLE == 0 {
+		return func() {}, nil
 	}
 
-	err = f.SetInodeFlags(flags &^ FS_IMMUTABLE_FL)
-	if err != nil {
+	if err := f.SetInodeFlags(flags &^ unix.STATX_ATTR_IMMUTABLE); err != nil {
 		return nil, err
 	}
-	return func() error {
-		return f.SetInodeFlags(flags)
+	return func() {
+		if err := f.SetInodeFlags(flags); err != nil {
+			// If setting the immutable did
+			// not work it's alright to do nothing
+			// because after a reboot the flag is
+			// automatically reapplied
+			return
+		}
 	}, nil
 }
 
-func maybeRetry(n int, fn func() (bool, error)) error {
+func maybeRetry(n int, fn func() error) error {
 	for i := 1; ; i++ {
-		retry, err := fn()
+		err := fn()
 		switch {
 		case i > n:
 			return err
-		case !retry:
+		case err != ErrVarRetry:
 			return err
 		case err == nil:
 			return nil
