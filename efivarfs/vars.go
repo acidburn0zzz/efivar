@@ -1,8 +1,3 @@
-// This code is a somewhat simplified and changed up version of
-// github.com/canonical/go-efilib credits go their authors.
-// It allows interaction with the efivarfs via u-root which means
-// both read and write support.
-
 package efivarfs
 
 import (
@@ -83,61 +78,93 @@ type file struct {
 
 // ReadVariable calls Get() on the current efivarfs backend
 func ReadVariable(name string, guid *guid.UUID) (VariableAttributes, []byte, error) {
-	return vars.Get(name, guid)
+	e, err := ProbeAndReturn()
+	if err != nil {
+		return 0, nil, err
+	}
+	return e.Get(name, guid)
 }
 
 // SimpleReadVariable is like ReadVariables but takes the combined name and guid string
 // of the form name-guid and returns a bytes.Reader instead of a []byte
 func SimpleReadVariable(v string) (VariableAttributes, *bytes.Reader, error) {
+	e, err := ProbeAndReturn()
+	if err != nil {
+		return 0, nil, err
+	}
 	vs := strings.SplitN(v, "-", 2)
 	g, err := guid.Parse(vs[1])
 	if err != nil {
 		return 0, nil, err
 	}
-	attrs, data, err := vars.Get(vs[0], &g)
+	attrs, data, err := e.Get(vs[0], &g)
 	return attrs, bytes.NewReader(data), err
 }
 
 // WriteVariable calls Set() on the current efivarfs backend
 func WriteVariable(name string, guid *guid.UUID, attrs VariableAttributes, data []byte) error {
-	return maybeRetry(4, func() error { return vars.Set(name, guid, attrs, data) })
+	e, err := ProbeAndReturn()
+	if err != nil {
+		return err
+	}
+	return maybeRetry(4, func() error { return e.Set(name, guid, attrs, data) })
 }
 
 // SimpleWriteVariable is like WriteVariables but takes the combined name and guid string
 // of the form name-guid and returns a bytes.Buffer instead of a []byte
 func SimpleWriteVariable(v string, attrs VariableAttributes, data bytes.Buffer) error {
+	e, err := ProbeAndReturn()
+	if err != nil {
+		return err
+	}
 	vs := strings.SplitN(v, "-", 2)
 	g, err := guid.Parse(vs[1])
 	if err != nil {
 		return err
 	}
-	return vars.Set(vs[0], &g, attrs, data.Bytes())
+	return e.Set(vs[0], &g, attrs, data.Bytes())
 }
 
 // RemoveVariable calls Remove() on the current efivarfs backend
 func RemoveVariable(name string, guid *guid.UUID) error {
-	return vars.Remove(name, guid)
+	e, err := ProbeAndReturn()
+	if err != nil {
+		return err
+	}
+	return e.Remove(name, guid)
 }
 
 // SimpleRemoveVariable is like RemoveVariable but takes the combined name and guid string
 // of the form name-guid
 func SimpleRemoveVariable(v string) error {
+	e, err := ProbeAndReturn()
+	if err != nil {
+		return err
+	}
 	vs := strings.SplitN(v, "-", 2)
 	g, err := guid.Parse(vs[1])
 	if err != nil {
 		return err
 	}
-	return vars.Remove(vs[0], &g)
+	return e.Remove(vs[0], &g)
 }
 
 // ListVariables calls List() on the current efivarfs backend
 func ListVariables() ([]VariableDescriptor, error) {
-	return vars.List()
+	e, err := ProbeAndReturn()
+	if err != nil {
+		return nil, err
+	}
+	return e.List()
 }
 
 // SimpleListVariables is like ListVariables but returns a []string instead of a []VariableDescriptor
 func SimpleListVariables() ([]string, error) {
-	list, err := vars.List()
+	e, err := ProbeAndReturn()
+	if err != nil {
+		return nil, err
+	}
+	list, err := e.List()
 	if err != nil {
 		return nil, err
 	}

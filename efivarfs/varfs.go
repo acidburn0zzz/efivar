@@ -1,8 +1,3 @@
-// This code is a somewhat simplified and changed up version of
-// github.com/canonical/go-efilib credits go their authors.
-// It allows interaction with the efivarfs via u-root which means
-// both read and write support.
-
 package efivarfs
 
 import (
@@ -33,17 +28,23 @@ type backend interface {
 	List() ([]VariableDescriptor, error)
 }
 
-type varfs struct{}
+type varfs struct {
+	backend
+}
 
-var vars backend = varfs{}
+func ProbeAndReturn() (*varfs, error) {
+	var stat unix.Statfs_t
+	if err := unix.Statfs(EfiVarFs, &stat); err != nil {
+		return nil, ErrFsNotMounted
+	}
+	if uint(stat.Type) != uint(unix.EFIVARFS_MAGIC) {
+		return nil, ErrFsNotMounted
+	}
+	return &varfs{}, nil
+}
 
 // Get reads the contents of an efivar if it exists and has the necessary permission
-func (v varfs) Get(name string, guid *guid.UUID) (VariableAttributes, []byte, error) {
-	// Check if there is an efivarfs present
-	if !probeEfivarfs(EfiVarFs) {
-		return 0, nil, ErrFsNotMounted
-	}
-
+func (v *varfs) Get(name string, guid *guid.UUID) (VariableAttributes, []byte, error) {
 	path := filepath.Join(EfiVarFs, fmt.Sprintf("%s-%s", name, guid.String()))
 	f, err := openFile(path, os.O_RDONLY, 0)
 	switch {
@@ -72,12 +73,7 @@ func (v varfs) Get(name string, guid *guid.UUID) (VariableAttributes, []byte, er
 }
 
 // Set modifies a given efivar with the provided contents
-func (v varfs) Set(name string, guid *guid.UUID, attrs VariableAttributes, data []byte) error {
-	// Check if there is an efivarfs present
-	if !probeEfivarfs(EfiVarFs) {
-		return ErrFsNotMounted
-	}
-
+func (v *varfs) Set(name string, guid *guid.UUID, attrs VariableAttributes, data []byte) error {
 	path := filepath.Join(EfiVarFs, fmt.Sprintf("%s-%s", name, guid.String()))
 	flags := os.O_WRONLY | os.O_CREATE
 	if attrs&AttributeAppendWrite != 0 {
@@ -138,10 +134,7 @@ func (v varfs) Set(name string, guid *guid.UUID, attrs VariableAttributes, data 
 	for len(data)%8 != 0 {
 		data = append(data, 0)
 	}
-	size, err := buf.Write(data)
-	if err != nil {
-		return err
-	}
+	size, _ := buf.Write(data)
 	if (size-4)%8 == 0 {
 		return fmt.Errorf("data misaligned")
 	}
@@ -152,12 +145,7 @@ func (v varfs) Set(name string, guid *guid.UUID, attrs VariableAttributes, data 
 }
 
 // Remove makes the specified EFI var mutable and then deletes it
-func (v varfs) Remove(name string, guid *guid.UUID) error {
-	// Check if there is an efivarfs present
-	if !probeEfivarfs(EfiVarFs) {
-		return ErrFsNotMounted
-	}
-
+func (v *varfs) Remove(name string, guid *guid.UUID) error {
 	path := filepath.Join(EfiVarFs, fmt.Sprintf("%s-%s", name, guid.String()))
 	f, err := openFile(path, os.O_WRONLY, 0)
 	switch {
@@ -182,12 +170,7 @@ func (v varfs) Remove(name string, guid *guid.UUID) error {
 }
 
 // List returns the VariableDescriptor for each efivar in the system
-func (v varfs) List() ([]VariableDescriptor, error) {
-	// Check if there is an efivarfs present
-	if !probeEfivarfs(EfiVarFs) {
-		return nil, ErrFsNotMounted
-	}
-
+func (v *varfs) List() ([]VariableDescriptor, error) {
 	const guidLength = 36
 	f, err := openFile(EfiVarFs, os.O_RDONLY, 0)
 	switch {
@@ -239,15 +222,4 @@ func (v varfs) List() ([]VariableDescriptor, error) {
 		return fmt.Sprintf("%s-%v", entries[i].Name, entries[i].GUID) < fmt.Sprintf("%s-%v", entries[j].Name, entries[j].GUID)
 	})
 	return entries, nil
-}
-
-func probeEfivarfs(path string) bool {
-	var stat unix.Statfs_t
-	if err := unix.Statfs(path, &stat); err != nil {
-		return false
-	}
-	if uint(stat.Type) != uint(unix.EFIVARFS_MAGIC) {
-		return false
-	}
-	return true
 }
