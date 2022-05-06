@@ -3,50 +3,65 @@ package efivarfs
 import (
 	"bytes"
 	"encoding/binary"
+	"errors"
 	"fmt"
 	"io"
 	"os"
 	"path/filepath"
 	"sort"
-	"syscall"
 
 	guid "github.com/google/uuid"
 	"golang.org/x/sys/unix"
 )
 
 // EfiVarFs is the path to the efivarfs mount point
+//
+// Note: This has to be a var instead of const because of
+// our unit tests.
 var EfiVarFs = "/sys/firmware/efi/efivars/"
 
-type backend interface {
-	// Get reads the contents of an efivar if it exists and has the necessary permission
-	Get(name string, guid *guid.UUID) (VariableAttributes, []byte, error)
-	// Set modifies a given efivar with the provided contents
-	Set(name string, guid *guid.UUID, attrs VariableAttributes, data []byte) error
-	// Remove makes the specified EFI var mutable and then deletes it
-	Remove(name string, guid *guid.UUID) error
-	// List returns the VariableDescriptor for each efivar in the system
-	List() ([]VariableDescriptor, error)
-}
+var (
+	// ErrFsNotMounted is caused if no vailed efivarfs magic is found
+	ErrFsNotMounted = errors.New("no efivarfs magic found, is it mounted?")
 
-type varfs struct {
-	backend
-}
+	// ErrVarsUnavailable is caused by not having a valid backend
+	ErrVarsUnavailable = errors.New("no variable backend is available")
 
-func ProbeAndReturn() (*varfs, error) {
+	// ErrVarNotExist is caused by accessing a non-existing variable
+	ErrVarNotExist = errors.New("variable does not exist")
+
+	// ErrVarPermission is caused by not haven the right permissions either
+	// because of not being root or xattrs not allowing changes
+	ErrVarPermission = errors.New("permission denied")
+)
+
+// efivarfs represents the real efivarfs of the Linux kernel
+// and has the relevant methods like get, set and remove, which
+// will operate on the actual efi variables inside the Linux
+// efivarfs backend.
+type efivarfs struct{}
+
+// probeAndReturn will probe for the efivarfs filesystem
+// magic value on the expected mountpoint inside the sysfs.
+// If the correct magic value was found it will return
+// the a pointer to an efivarfs struct on which regular
+// operations can be done. Otherwise it will return an
+// error of type ErrFsNotMounted.
+func probeAndReturn() (*efivarfs, error) {
 	var stat unix.Statfs_t
 	if err := unix.Statfs(EfiVarFs, &stat); err != nil {
-		return nil, ErrFsNotMounted
+		return nil, fmt.Errorf("statfs error occured: %w", ErrFsNotMounted)
 	}
 	if uint(stat.Type) != uint(unix.EFIVARFS_MAGIC) {
-		return nil, ErrFsNotMounted
+		return nil, fmt.Errorf("wrong fs type: %w", ErrFsNotMounted)
 	}
-	return &varfs{}, nil
+	return &efivarfs{}, nil
 }
 
-// Get reads the contents of an efivar if it exists and has the necessary permission
-func (v *varfs) Get(name string, guid *guid.UUID) (VariableAttributes, []byte, error) {
-	path := filepath.Join(EfiVarFs, fmt.Sprintf("%s-%s", name, guid.String()))
-	f, err := openFile(path, os.O_RDONLY, 0)
+// get reads the contents of an efivar if it exists and has the necessary permission
+func (v *efivarfs) get(desc VariableDescriptor) (VariableAttributes, []byte, error) {
+	path := filepath.Join(EfiVarFs, fmt.Sprintf("%s-%s", desc.Name, desc.GUID.String()))
+	f, err := os.OpenFile(path, os.O_RDONLY, 0)
 	switch {
 	case os.IsNotExist(err):
 		return 0, nil, ErrVarNotExist
@@ -72,15 +87,15 @@ func (v *varfs) Get(name string, guid *guid.UUID) (VariableAttributes, []byte, e
 	return attrs, data, nil
 }
 
-// Set modifies a given efivar with the provided contents
-func (v *varfs) Set(name string, guid *guid.UUID, attrs VariableAttributes, data []byte) error {
-	path := filepath.Join(EfiVarFs, fmt.Sprintf("%s-%s", name, guid.String()))
+// set modifies a given efivar with the provided contents
+func (v *efivarfs) set(desc VariableDescriptor, attrs VariableAttributes, data []byte) error {
+	path := filepath.Join(EfiVarFs, fmt.Sprintf("%s-%s", desc.Name, desc.GUID.String()))
 	flags := os.O_WRONLY | os.O_CREATE
 	if attrs&AttributeAppendWrite != 0 {
 		flags |= os.O_APPEND
 	}
 
-	read, err := openFile(path, os.O_RDONLY, 0)
+	read, err := os.OpenFile(path, os.O_RDONLY, 0)
 	switch {
 	case os.IsNotExist(err):
 	case os.IsPermission(err):
@@ -90,7 +105,7 @@ func (v *varfs) Set(name string, guid *guid.UUID, attrs VariableAttributes, data
 	default:
 		defer read.Close()
 
-		restoreImmutable, err := makeVarFileMutable(read)
+		restoreImmutable, err := makeMutable(read)
 		switch {
 		case os.IsPermission(err):
 			return ErrVarPermission
@@ -100,28 +115,12 @@ func (v *varfs) Set(name string, guid *guid.UUID, attrs VariableAttributes, data
 		defer restoreImmutable()
 	}
 
-	write, err := openFile(path, flags, 0644)
+	write, err := os.OpenFile(path, flags, 0644)
 	switch {
+	case os.IsNotExist(err):
+		return ErrVarNotExist
 	case os.IsPermission(err):
-		pe, ok := err.(*os.PathError)
-		if !ok {
-			return err
-		}
-		if pe.Err == syscall.EACCES {
-			// open will fail with EACCES if we lack the privileges
-			// to write to the file or the parent directory in the
-			// case where we need to create a new file. Don't retry
-			// in this case.
-			return ErrVarPermission
-		}
-
-		// open will fail with EPERM if the file exists but we can't
-		// write to it because it is immutable. This might happen as a
-		// result of a race with another process that might have been
-		// writing to the variable or may have deleted and recreated
-		// it, making the underlying inode immutable again. Retry in
-		// this case.
-		return ErrVarRetry
+		return ErrVarPermission
 	case err != nil:
 		return err
 	}
@@ -131,12 +130,8 @@ func (v *varfs) Set(name string, guid *guid.UUID, attrs VariableAttributes, data
 	if err := binary.Write(&buf, binary.LittleEndian, attrs); err != nil {
 		return err
 	}
-	for len(data)%8 != 0 {
-		data = append(data, 0)
-	}
-	size, _ := buf.Write(data)
-	if (size-4)%8 == 0 {
-		return fmt.Errorf("data misaligned")
+	if _, err := buf.Write(data); err != nil {
+		return err
 	}
 	if _, err := buf.WriteTo(write); err != nil {
 		return err
@@ -144,10 +139,10 @@ func (v *varfs) Set(name string, guid *guid.UUID, attrs VariableAttributes, data
 	return nil
 }
 
-// Remove makes the specified EFI var mutable and then deletes it
-func (v *varfs) Remove(name string, guid *guid.UUID) error {
-	path := filepath.Join(EfiVarFs, fmt.Sprintf("%s-%s", name, guid.String()))
-	f, err := openFile(path, os.O_WRONLY, 0)
+// remove makes the specified EFI var mutable and then deletes it
+func (v *efivarfs) remove(desc VariableDescriptor) error {
+	path := filepath.Join(EfiVarFs, fmt.Sprintf("%s-%s", desc.Name, desc.GUID.String()))
+	f, err := os.OpenFile(path, os.O_WRONLY, 0)
 	switch {
 	case os.IsNotExist(err):
 		return ErrVarNotExist
@@ -156,7 +151,7 @@ func (v *varfs) Remove(name string, guid *guid.UUID) error {
 	case err != nil:
 		return err
 	default:
-		_, err := makeVarFileMutable(f)
+		_, err := makeMutable(f)
 		switch {
 		case os.IsPermission(err):
 			return ErrVarPermission
@@ -169,10 +164,10 @@ func (v *varfs) Remove(name string, guid *guid.UUID) error {
 	return os.Remove(path)
 }
 
-// List returns the VariableDescriptor for each efivar in the system
-func (v *varfs) List() ([]VariableDescriptor, error) {
+// list returns the VariableDescriptor for each efivar in the system
+func (v *efivarfs) list() ([]VariableDescriptor, error) {
 	const guidLength = 36
-	f, err := openFile(EfiVarFs, os.O_RDONLY, 0)
+	f, err := os.OpenFile(EfiVarFs, os.O_RDONLY, 0)
 	switch {
 	case os.IsNotExist(err):
 		return nil, ErrVarNotExist

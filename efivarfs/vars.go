@@ -2,8 +2,6 @@ package efivarfs
 
 import (
 	"bytes"
-	"errors"
-	"io"
 	"os"
 	"strings"
 
@@ -33,62 +31,25 @@ const (
 	AttributeEnhancedAuthenticatedAccess VariableAttributes = 0x00000080
 )
 
-var (
-	// ErrFsNotMounted is caused if no vailed efivarfs magic is found
-	ErrFsNotMounted = errors.New("no efivarfs magic found, is it mounted?")
-
-	// ErrVarsUnavailable is caused by not having a valid backend
-	ErrVarsUnavailable = errors.New("no variable backend is available")
-
-	// ErrVarNotExist is caused by accessing a non-existing variable
-	ErrVarNotExist = errors.New("variable does not exist")
-
-	// ErrVarPermission is caused by not haven the right permissions either
-	// because of not being root or xattrs not allowing changes
-	ErrVarPermission = errors.New("permission denied")
-
-	// ErrVarRetry is caused if the previous action failed under a condition
-	// that indicates a retry might be necessary to fullfill the action
-	ErrVarRetry = errors.New("retry needed")
-)
-
 // VariableDescriptor contains the name and GUID identifying a variable
 type VariableDescriptor struct {
 	Name string
 	GUID *guid.UUID
 }
 
-// File represents a file inside the efivarfs
-type File interface {
-	io.ReadWriteCloser
-
-	// Readdir is analog to fs.ReadDir
-	Readdir(n int) ([]os.FileInfo, error)
-
-	// GetInodeFlags returns the extended attributes of a file
-	GetInodeFlags() (int, error)
-
-	// SetInodeFlags sets the extended attributes of a file
-	SetInodeFlags(flags int) error
-}
-
-type file struct {
-	*os.File
-}
-
-// ReadVariable calls Get() on the current efivarfs backend
-func ReadVariable(name string, guid *guid.UUID) (VariableAttributes, []byte, error) {
-	e, err := ProbeAndReturn()
+// ReadVariable calls get() on the current efivarfs backend.
+func ReadVariable(desc VariableDescriptor) (VariableAttributes, []byte, error) {
+	e, err := probeAndReturn()
 	if err != nil {
 		return 0, nil, err
 	}
-	return e.Get(name, guid)
+	return e.get(desc)
 }
 
 // SimpleReadVariable is like ReadVariables but takes the combined name and guid string
-// of the form name-guid and returns a bytes.Reader instead of a []byte
+// of the form name-guid and returns a bytes.Reader instead of a []byte.
 func SimpleReadVariable(v string) (VariableAttributes, *bytes.Reader, error) {
-	e, err := ProbeAndReturn()
+	e, err := probeAndReturn()
 	if err != nil {
 		return 0, nil, err
 	}
@@ -97,23 +58,28 @@ func SimpleReadVariable(v string) (VariableAttributes, *bytes.Reader, error) {
 	if err != nil {
 		return 0, nil, err
 	}
-	attrs, data, err := e.Get(vs[0], &g)
+	attrs, data, err := e.get(
+		VariableDescriptor{
+			Name: vs[0],
+			GUID: &g,
+		},
+	)
 	return attrs, bytes.NewReader(data), err
 }
 
-// WriteVariable calls Set() on the current efivarfs backend
-func WriteVariable(name string, guid *guid.UUID, attrs VariableAttributes, data []byte) error {
-	e, err := ProbeAndReturn()
+// WriteVariable calls set() on the current efivarfs backend.
+func WriteVariable(desc VariableDescriptor, attrs VariableAttributes, data []byte) error {
+	e, err := probeAndReturn()
 	if err != nil {
 		return err
 	}
-	return maybeRetry(4, func() error { return e.Set(name, guid, attrs, data) })
+	return e.set(desc, attrs, data)
 }
 
 // SimpleWriteVariable is like WriteVariables but takes the combined name and guid string
-// of the form name-guid and returns a bytes.Buffer instead of a []byte
+// of the form name-guid and returns a bytes.Buffer instead of a []byte.
 func SimpleWriteVariable(v string, attrs VariableAttributes, data bytes.Buffer) error {
-	e, err := ProbeAndReturn()
+	e, err := probeAndReturn()
 	if err != nil {
 		return err
 	}
@@ -122,22 +88,27 @@ func SimpleWriteVariable(v string, attrs VariableAttributes, data bytes.Buffer) 
 	if err != nil {
 		return err
 	}
-	return e.Set(vs[0], &g, attrs, data.Bytes())
+	return e.set(
+		VariableDescriptor{
+			Name: vs[0],
+			GUID: &g,
+		}, attrs, data.Bytes(),
+	)
 }
 
-// RemoveVariable calls Remove() on the current efivarfs backend
-func RemoveVariable(name string, guid *guid.UUID) error {
-	e, err := ProbeAndReturn()
+// RemoveVariable calls remove() on the current efivarfs backend.
+func RemoveVariable(desc VariableDescriptor) error {
+	e, err := probeAndReturn()
 	if err != nil {
 		return err
 	}
-	return e.Remove(name, guid)
+	return e.remove(desc)
 }
 
 // SimpleRemoveVariable is like RemoveVariable but takes the combined name and guid string
-// of the form name-guid
+// of the form name-guid.
 func SimpleRemoveVariable(v string) error {
-	e, err := ProbeAndReturn()
+	e, err := probeAndReturn()
 	if err != nil {
 		return err
 	}
@@ -146,25 +117,30 @@ func SimpleRemoveVariable(v string) error {
 	if err != nil {
 		return err
 	}
-	return e.Remove(vs[0], &g)
+	return e.remove(
+		VariableDescriptor{
+			Name: vs[0],
+			GUID: &g,
+		},
+	)
 }
 
-// ListVariables calls List() on the current efivarfs backend
+// ListVariables calls list() on the current efivarfs backend.
 func ListVariables() ([]VariableDescriptor, error) {
-	e, err := ProbeAndReturn()
+	e, err := probeAndReturn()
 	if err != nil {
 		return nil, err
 	}
-	return e.List()
+	return e.list()
 }
 
-// SimpleListVariables is like ListVariables but returns a []string instead of a []VariableDescriptor
+// SimpleListVariables is like ListVariables but returns a []string instead of a []VariableDescriptor.
 func SimpleListVariables() ([]string, error) {
-	e, err := ProbeAndReturn()
+	e, err := probeAndReturn()
 	if err != nil {
 		return nil, err
 	}
-	list, err := e.List()
+	list, err := e.list()
 	if err != nil {
 		return nil, err
 	}
@@ -175,16 +151,8 @@ func SimpleListVariables() ([]string, error) {
 	return out, nil
 }
 
-func openFile(path string, flags int, perm os.FileMode) (File, error) {
-	f, err := os.OpenFile(path, flags, perm)
-	if err != nil {
-		return nil, err
-	}
-	return &file{f}, nil
-}
-
-// GetInodeFlags returns the extended attributes of a file
-func (f *file) GetInodeFlags() (int, error) {
+// getInodeFlags returns the extended attributes of a file.
+func getInodeFlags(f *os.File) (int, error) {
 	// If I knew how unix.Getxattr works I'd use that...
 	flags, err := unix.IoctlGetInt(int(f.Fd()), unix.FS_IOC_GETFLAGS)
 	if err != nil {
@@ -193,8 +161,8 @@ func (f *file) GetInodeFlags() (int, error) {
 	return flags, nil
 }
 
-// SetInodeFlags sets the extended attributes of a file
-func (f *file) SetInodeFlags(flags int) error {
+// setInodeFlags sets the extended attributes of a file.
+func setInodeFlags(f *os.File, flags int) error {
 	// If I knew how unix.Setxattr works I'd use that...
 	if err := unix.IoctlSetPointerInt(int(f.Fd()), unix.FS_IOC_SETFLAGS, flags); err != nil {
 		return &os.PathError{Op: "ioctl", Path: f.Name(), Err: err}
@@ -202,8 +170,11 @@ func (f *file) SetInodeFlags(flags int) error {
 	return nil
 }
 
-func makeVarFileMutable(f File) (restore func(), err error) {
-	flags, err := f.GetInodeFlags()
+// makeMutable will change a files xattrs so that
+// the immutable flag is removed and return a restore
+// function which can reset the flag for that filee.
+func makeMutable(f *os.File) (restore func(), err error) {
+	flags, err := getInodeFlags(f)
 	if err != nil {
 		return nil, err
 	}
@@ -211,11 +182,11 @@ func makeVarFileMutable(f File) (restore func(), err error) {
 		return func() {}, nil
 	}
 
-	if err := f.SetInodeFlags(flags &^ unix.STATX_ATTR_IMMUTABLE); err != nil {
+	if err := setInodeFlags(f, flags&^unix.STATX_ATTR_IMMUTABLE); err != nil {
 		return nil, err
 	}
 	return func() {
-		if err := f.SetInodeFlags(flags); err != nil {
+		if err := setInodeFlags(f, flags); err != nil {
 			// If setting the immutable did
 			// not work it's alright to do nothing
 			// because after a reboot the flag is
@@ -223,18 +194,4 @@ func makeVarFileMutable(f File) (restore func(), err error) {
 			return
 		}
 	}, nil
-}
-
-func maybeRetry(n int, fn func() error) error {
-	for i := 1; ; i++ {
-		err := fn()
-		switch {
-		case i > n:
-			return err
-		case err != ErrVarRetry:
-			return err
-		case err == nil:
-			return nil
-		}
-	}
 }
